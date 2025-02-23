@@ -1,0 +1,12 @@
+
+# pixi environments
+.pixi
+*.egg-info
+
+*.pyc
+*.pyo
+
+data/*
+work_dir/*
+
+torchlight/build/*

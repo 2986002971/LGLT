@@ -18,8 +18,8 @@ model: model.lglt.LGLT
 model_args:
   num_class: 10
   num_frames: 200
-  num_edges: 19  # UCLA数据集的边数
-  in_channels: 3  # 方向余弦的维度
+  num_edges: 19  # UCLA数据集的边数，线图的节点数
+  in_channels: 3
   embed_dim: 64
   num_layers: 4
   num_heads: 8

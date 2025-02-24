@@ -21,6 +21,9 @@ tensorboardX = "*"
 scikit-learn = "*"
 h5py = "*"
 matplotlib = "*"
+networkx = "*"
+einops = ">=0.8.1,<0.9"
+timm = ">=1.0.14,<2"
 
 [pypi-dependencies]
 torchlight = {path = "./torchlight"}

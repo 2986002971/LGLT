@@ -693,7 +693,7 @@ if __name__ == "__main__":
     # load arg form config file
     p = parser.parse_args()
     if p.config is not None:
-        with open(p.config, "r") as f:
+        with open(p.config, "r", encoding='utf-8') as f:
             default_arg = yaml.load(f, Loader=yaml.SafeLoader)
         key = vars(p).keys()
         for k in default_arg.keys():

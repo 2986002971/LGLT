@@ -2,28 +2,35 @@ import torch
 import torch.nn as nn
 from einops import rearrange
 from timm.models.layers import DropPath
+import math
 
-
-class SpatialAttention(nn.Module):
-    """空间域注意力模块"""
+class GeometricCosineAttention(nn.Module):
+    """基于几何约束的方向余弦空间注意力模块 - 延后归一化版本"""
 
     def __init__(self, dim, num_heads=8, qkv_bias=False, attn_drop=0.0, proj_drop=0.0):
         super().__init__()
         self.num_heads = num_heads
-        head_dim = dim // num_heads
-        self.scale = head_dim**-0.5
-
+        
+        # 确保每个头有3个通道对应x,y,z方向
+        assert dim % num_heads == 0 and (dim // num_heads) >= 3, "维度必须能被头数整除且每个头至少3个通道"
+        self.head_dim = dim // num_heads
+        
         # QKV的映射矩阵
         self.q_proj = nn.Linear(dim, dim, bias=qkv_bias)
         self.k_proj = nn.Linear(dim, dim, bias=qkv_bias)
         self.v_proj = nn.Linear(dim, dim, bias=qkv_bias)
-
+        
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
-
-        # 添加一个gamma参数用于控制残差强度
+        
         self.gamma = nn.Parameter(torch.zeros(1))
+        
+        # 是否使用softmax (可配置参数)
+        self.use_softmax = False
+        
+        # 输出归一化
+        self.output_norm = nn.LayerNorm(dim)
 
     def forward(self, x, adj_mask):
         """
@@ -32,42 +39,45 @@ class SpatialAttention(nn.Module):
             adj_mask: 邻接矩阵 [E, E]
         """
         identity = x
-
         B, E, C = x.shape
-
+        
         # 生成QKV
-        q = (
-            self.q_proj(x)
-            .reshape(B, E, self.num_heads, C // self.num_heads)
-            .permute(0, 2, 1, 3)
-        )
-        k = (
-            self.k_proj(x)
-            .reshape(B, E, self.num_heads, C // self.num_heads)
-            .permute(0, 2, 1, 3)
-        )
-        v = (
-            self.v_proj(x)
-            .reshape(B, E, self.num_heads, C // self.num_heads)
-            .permute(0, 2, 1, 3)
-        )
-
-        # 计算注意力分数
-        attn = (q @ k.transpose(-2, -1)) * self.scale  # [B, num_heads, E, E]
-
-        # 使用邻接矩阵过滤，引入先验拓扑信息
+        q = self.q_proj(x).reshape(B, E, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        k = self.k_proj(x).reshape(B, E, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        v = self.v_proj(x).reshape(B, E, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        
+        # 只使用前3个通道作为方向余弦
+        q_dir = q[:, :, :, :3]  # [B, num_heads, E, 3]
+        k_dir = k[:, :, :, :3]  # [B, num_heads, E, 3]
+        
+        # 通过方向余弦点积计算余弦相似度
+        attn = torch.matmul(q_dir, k_dir.transpose(-2, -1))  # [B, num_heads, E, E]
+        
+        # 应用邻接矩阵掩码
         mask = adj_mask.unsqueeze(0).unsqueeze(0)  # [1, 1, E, E]
-        attn = attn.masked_fill(mask == 0, float("-inf"))
-
-        attn = attn.softmax(dim=-1)
+        
+        if self.use_softmax:
+            # 传统方式：使用softmax时需要将不连接的边设为-inf
+            attn = attn.masked_fill(mask == 0, float("-inf"))
+            attn = attn.softmax(dim=-1)
+        else:
+            # 几何方式：直接用掩码过滤不连接的边
+            attn = attn * mask  # 不连接的边乘以0，消除其影响
+            # 确保值在[0,1]范围内（将[-1,1]映射到[0,1]）
+            attn = (attn + 1) / 2
+            # 移除行归一化步骤，保留原始几何相似度强度
+        
         attn = self.attn_drop(attn)
-
-        # 注意力输出
+        
+        # 应用注意力
         x = (attn @ v).transpose(1, 2).reshape(B, E, C)
+        
+        # 投影后应用归一化以保持几何约束
         x = self.proj(x)
+        x = self.output_norm(x)  # 归一化延后到这里，处理聚合后的特征
         x = self.proj_drop(x)
-
-        # 添加残差连接，使用gamma参数控制
+        
+        # 添加残差连接
         return identity + self.gamma * x
 
 
@@ -154,7 +164,7 @@ class ST_TR_Block(nn.Module):
 
         # 空间注意力
         self.norm1 = nn.LayerNorm(dim)
-        self.spatial_attn = SpatialAttention(
+        self.spatial_attn = GeometricCosineAttention(
             dim,
             num_heads=num_heads,
             qkv_bias=qkv_bias,
@@ -209,6 +219,18 @@ class ST_TR_Block(nn.Module):
         return x
 
 
+def get_sinusoid_encoding_table(length, dim):
+    """生成正弦余弦位置编码表"""
+    position = torch.arange(length, dtype=torch.float).unsqueeze(1)
+    div_term = torch.exp(torch.arange(0, dim, 2).float() * (-math.log(10000.0) / dim))
+    
+    pos_table = torch.zeros(length, dim)
+    pos_table[:, 0::2] = torch.sin(position * div_term)
+    pos_table[:, 1::2] = torch.cos(position * div_term)
+    
+    return pos_table
+
+
 class LGLT(nn.Module):
     """Line Graph Linear Transformer for Skeleton-based Action Recognition"""
 
@@ -227,6 +249,7 @@ class LGLT(nn.Module):
         attn_drop_rate=0.0,
         drop_path_rate=0.1,
         norm_layer=nn.LayerNorm,
+        use_learnable_pos_emb=True,
     ):
         super().__init__()
 
@@ -235,16 +258,22 @@ class LGLT(nn.Module):
         self.num_frames = num_frames
         self.num_edges = num_edges
         self.in_channels = in_channels
+        self.use_learnable_pos_emb = use_learnable_pos_emb
 
         # 特征嵌入
         self.embed = nn.Sequential(
             nn.Linear(in_channels, embed_dim), norm_layer(embed_dim)
         )
 
-        # 只保留时间位置编码
-        self.pos_embed_temporal = nn.Parameter(torch.zeros(1, num_frames, embed_dim))
-        # 移除空间位置编码
-        # self.pos_embed_spatial = nn.Parameter(torch.zeros(1, num_edges, embed_dim))
+        # 位置编码
+        if use_learnable_pos_emb:
+            # 可学习的位置编码
+            self.pos_embed_temporal = nn.Parameter(torch.zeros(1, num_frames, embed_dim))
+            nn.init.trunc_normal_(self.pos_embed_temporal, std=0.02)
+        else:
+            # 固定的正弦余弦位置编码
+            pos_table = get_sinusoid_encoding_table(num_frames, embed_dim)
+            self.register_buffer('pos_embed_temporal', pos_table.unsqueeze(0))  # [1, T, embed_dim]
 
         # Drop path
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, num_layers)]
@@ -275,7 +304,6 @@ class LGLT(nn.Module):
         )
 
         # 初始化
-        nn.init.trunc_normal_(self.pos_embed_temporal, std=0.02)
         self.apply(self._init_weights)
 
     def _init_weights(self, m):
@@ -287,11 +315,12 @@ class LGLT(nn.Module):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
 
-    def forward(self, x, adj_mask):
+    def forward(self, x, adj_mask, pos_encodings=None):
         """
         Args:
             x: 输入特征 [B, C, T, E]
             adj_mask: 邻接矩阵 [E, E]
+            pos_encodings: 预计算的位置编码 [B, T, embed_dim]
         """
         B, C, T, E = x.shape
 
@@ -309,11 +338,14 @@ class LGLT(nn.Module):
         x = self.embed(x)
         x = rearrange(x, "(b t) e c -> b t e c", b=B)
 
-        # 获取实际序列对应的位置编码
-        pos_embed = self.pos_embed_temporal[:, :T, :]  # [1, T, embed_dim]
-        # 调整位置编码维度以匹配特征维度
-        pos_embed = pos_embed.unsqueeze(2)  # [1, T, 1, embed_dim]
-        x = x + pos_embed  # 广播机制会处理批次和边的维度
+        # 使用预计算的位置编码或模型内置的位置编码
+        if pos_encodings is not None:
+            pos_embed = pos_encodings.unsqueeze(2)  # [B, T, 1, embed_dim]
+        else:
+            # 使用模型内置的位置编码（可学习或固定）
+            pos_embed = self.pos_embed_temporal[:, :T, :].unsqueeze(2)  # [1, T, 1, embed_dim]
+
+        x = x + pos_embed
 
         # 通过Transformer块
         for blk in self.blocks:

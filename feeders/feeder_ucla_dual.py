@@ -1,6 +1,7 @@
 import json
 import math
 import random
+import torch
 
 import numpy as np
 from torch.utils.data import Dataset
@@ -13,6 +14,16 @@ def import_class(name):
         mod = getattr(mod, comp)
     return mod
 
+def get_sinusoid_encoding_table(length, dim):
+    """生成正弦余弦位置编码表"""
+    position = torch.arange(length, dtype=torch.float).unsqueeze(1)
+    div_term = torch.exp(torch.arange(0, dim, 2).float() * (-math.log(10000.0) / dim))
+    
+    pos_table = torch.zeros(length, dim)
+    pos_table[:, 0::2] = torch.sin(position * div_term)
+    pos_table[:, 1::2] = torch.cos(position * div_term)
+    
+    return pos_table
 
 class FeederDual(Dataset):
     def __init__(
@@ -1588,36 +1599,45 @@ class FeederDual(Dataset):
             .reshape((C, 1, E))  # (C, 1, E)
         )
 
+   
     def load_data(self):
         """加载边特征数据"""
         temp_data = []
+        temp_pos_encodings = []  # 存储每个序列的位置编码
         target_frames = 200  # 统一的序列长度
-
+        
         for item in self.data_dict:
             file_name = item["file_name"]
             with open(f"{self.edge_feature_path}{file_name}.json", "r") as f:
                 edge_data = json.load(f)
-
+                
             # 获取边特征 (T, E, C)
             features = np.array(edge_data["edge_cosines"])
             features = self._normalize_features(features)
-
-            # 重采样到目标帧数
+            
+            # 为原始序列生成位置编码
             orig_frames = features.shape[0]
+            pos_encoding = get_sinusoid_encoding_table(orig_frames, self.embed_dim)
+            
+            # 重采样原始序列和位置编码到目标帧数
             indices = np.linspace(0, orig_frames - 1, target_frames)
             indices = indices.astype(np.int32)
             features = features[indices]  # (target_frames, E, C)
+            pos_encoding = pos_encoding[indices]  # (target_frames, embed_dim)
 
-            # 转换为(C, T, E)格式
+            
+            # 转换格式并存储
             features = np.transpose(features, (2, 0, 1))  # (C, target_frames, E)
-
-            # 添加batch维度
             features = np.expand_dims(features, axis=0)  # (1, C, T, E)
-
             temp_data.append(features)
-
-        # 将所有样本合并
+            
+            # 存储位置编码
+            pos_encoding = np.expand_dims(pos_encoding, axis=0)  # (1, T, embed_dim)
+            temp_pos_encodings.append(pos_encoding)
+            
+        # 合并所有样本
         self.data = np.concatenate(temp_data, axis=0)  # (N, C, T, E)
+        self.pos_encodings = np.concatenate(temp_pos_encodings, axis=0)  # (N, T, embed_dim)
 
     def _normalize_features(self, features):
         """特征归一化,使用MinMax或均值标准差"""

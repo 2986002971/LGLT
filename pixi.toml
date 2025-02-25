@@ -2,7 +2,7 @@
 authors = ["horned_axe <horned_axe@proton.me>"]
 channels = ["nvidia/label/cuda-12.4.0","nvidia", "conda-forge", "pytorch"]
 description = "Add a short description here"
-name = "CTR-GCN"
+name = "LGLT"
 platforms = ["linux-64", "win-64"]
 version = "0.1.0"
 

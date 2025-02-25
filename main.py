@@ -440,16 +440,17 @@ class Processor:
         timer = dict(dataloader=0.001, model=0.001, statistics=0.001)
         process = tqdm(loader, ncols=40)
 
-        for batch_idx, (data, label, index) in enumerate(process):
+        for batch_idx, (data, label, pos_encoding, index) in enumerate(process):
             self.global_step += 1
             with torch.no_grad():
                 data = data.float().cuda(self.output_device)
                 label = label.long().cuda(self.output_device)
+                pos_encoding = pos_encoding.float().to(self.output_device)
             timer["dataloader"] += self.split_time()
 
             # forward
             if "lglt" in self.arg.model.lower():
-                output = self.model(data, self.adj_matrix)
+                output = self.model(data, self.adj_matrix, pos_encodings=pos_encoding)
             else:
                 output = self.model(data)
             loss = self.loss(output, label)
@@ -525,13 +526,16 @@ class Processor:
             pred_list = []
             step = 0
             process = tqdm(self.data_loader[ln], ncols=40)
-            for batch_idx, (data, label, index) in enumerate(process):
+            for batch_idx, (data, label, pos_encoding, index) in enumerate(process):
                 label_list.append(label)
                 with torch.no_grad():
                     data = data.float().cuda(self.output_device)
                     label = label.long().cuda(self.output_device)
+                    pos_encoding = pos_encoding.float().to(self.output_device)
                     if "lglt" in self.arg.model.lower():
-                        output = self.model(data, self.adj_matrix)
+                        output = self.model(
+                            data, self.adj_matrix, pos_encodings=pos_encoding
+                        )
                     else:
                         output = self.model(data)
                     loss = self.loss(output, label)
@@ -693,7 +697,7 @@ if __name__ == "__main__":
     # load arg form config file
     p = parser.parse_args()
     if p.config is not None:
-        with open(p.config, "r", encoding='utf-8') as f:
+        with open(p.config, "r", encoding="utf-8") as f:
             default_arg = yaml.load(f, Loader=yaml.SafeLoader)
         key = vars(p).keys()
         for k in default_arg.keys():

@@ -6,12 +6,14 @@ train_feeder_args:
   debug: False
   repeat: 5
   normalization: False
+  embed_dim: 64
 
 test_feeder_args:
   data_path: data/NW-UCLA/all_sqe_edge
   label_path: val
   debug: False
   normalization: False
+  embed_dim: 64
 
 # model
 model: model.lglt.LGLT

@@ -233,8 +233,275 @@ def get_sinusoid_encoding_table(length, dim):
     return pos_table
 
 
+# class LGLT(nn.Module):
+#     """Line Graph Linear Transformer for Skeleton-based Action Recognition"""
+
+#     def __init__(
+#         self,
+#         num_class,
+#         num_frames,
+#         num_edges,
+#         in_channels=3,
+#         embed_dim=64,
+#         num_layers=4,
+#         num_heads=8,
+#         mlp_ratio=4.0,
+#         qkv_bias=True,
+#         drop_rate=0.0,
+#         attn_drop_rate=0.0,
+#         drop_path_rate=0.1,
+#         norm_layer=nn.LayerNorm,
+#         use_learnable_pos_emb=True,
+#     ):
+#         super().__init__()
+
+#         # 基本参数
+#         self.num_class = num_class
+#         self.num_frames = num_frames
+#         self.num_edges = num_edges
+#         self.in_channels = in_channels
+#         self.use_learnable_pos_emb = use_learnable_pos_emb
+
+#         # 特征嵌入
+#         self.embed = nn.Sequential(
+#             nn.Linear(in_channels, embed_dim), norm_layer(embed_dim)
+#         )
+
+#         # 位置编码
+#         if use_learnable_pos_emb:
+#             # 可学习的位置编码
+#             self.pos_embed_temporal = nn.Parameter(
+#                 torch.zeros(1, num_frames, embed_dim)
+#             )
+#             nn.init.trunc_normal_(self.pos_embed_temporal, std=0.02)
+#         else:
+#             # 固定的正弦余弦位置编码
+#             pos_table = get_sinusoid_encoding_table(num_frames, embed_dim)
+#             self.register_buffer(
+#                 "pos_embed_temporal", pos_table.unsqueeze(0)
+#             )  # [1, T, embed_dim]
+
+#         # Drop path
+#         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, num_layers)]
+
+#         # Transformer blocks
+#         self.blocks = nn.ModuleList(
+#             [
+#                 ST_TR_Block(
+#                     dim=embed_dim,
+#                     num_heads=num_heads,
+#                     mlp_ratio=mlp_ratio,
+#                     qkv_bias=qkv_bias,
+#                     drop=drop_rate,
+#                     attn_drop=attn_drop_rate,
+#                     drop_path=dpr[i],
+#                 )
+#                 for i in range(num_layers)
+#             ]
+#         )
+
+#         # 输出层
+#         self.norm = norm_layer(embed_dim)
+#         self.head = nn.Sequential(
+#             nn.Linear(embed_dim, embed_dim),
+#             nn.GELU(),
+#             nn.Dropout(drop_rate),
+#             nn.Linear(embed_dim, num_class),
+#         )
+
+#         # 初始化
+#         self.apply(self._init_weights)
+
+#     def _init_weights(self, m):
+#         if isinstance(m, nn.Linear):
+#             nn.init.trunc_normal_(m.weight, std=0.02)
+#             if isinstance(m, nn.Linear) and m.bias is not None:
+#                 nn.init.constant_(m.bias, 0)
+#         elif isinstance(m, nn.LayerNorm):
+#             nn.init.constant_(m.bias, 0)
+#             nn.init.constant_(m.weight, 1.0)
+
+#     def forward(self, x, adj_mask, pos_encodings=None):
+#         """
+#         Args:
+#             x: 输入特征 [B, C, T, E]
+#             adj_mask: 邻接矩阵 [E, E]
+#             pos_encodings: 预计算的位置编码 [B, T, embed_dim]
+#         """
+#         B, C, T, E = x.shape
+
+#         # 形状检查
+#         assert E == self.num_edges, f"边数不匹配：期望 {self.num_edges}，实际得到 {E}"
+#         assert T <= self.num_frames, (
+#             f"时间步数超出限制：期望 <= {self.num_frames}，实际得到 {T}"
+#         )
+#         assert C == self.in_channels, (
+#             f"输入通道数不匹配：期望 {self.in_channels}，实际得到 {C}"
+#         )
+
+#         # 重排并嵌入
+#         x = rearrange(x, "b c t e -> (b t) e c")
+#         x = self.embed(x)
+#         x = rearrange(x, "(b t) e c -> b t e c", b=B)
+
+#         # 使用预计算的位置编码或模型内置的位置编码
+#         if pos_encodings is not None:
+#             pos_embed = pos_encodings.unsqueeze(2)  # [B, T, 1, embed_dim]
+#         else:
+#             # 使用模型内置的位置编码（可学习或固定）
+#             pos_embed = self.pos_embed_temporal[:, :T, :].unsqueeze(
+#                 2
+#             )  # [1, T, 1, embed_dim]
+
+#         x = x + pos_embed
+
+#         # 通过Transformer块
+#         for blk in self.blocks:
+#             x = blk(x, adj_mask)
+
+#         # 全局池化
+#         x = x.mean(dim=2)  # 空间池化
+#         x = x.mean(dim=1)  # 时间池化
+
+#         # 分类
+#         x = self.norm(x)
+#         x = self.head(x)
+
+#         return x
+
+
+class TemporalDownsampling(nn.Module):
+    """时间维度下采样模块"""
+
+    def __init__(self, dim, scale_factor=2, mode="conv"):
+        super().__init__()
+        self.mode = mode
+        self.scale_factor = scale_factor
+
+        if mode == "conv":
+            # 使用步长为scale_factor的卷积进行下采样
+            self.downsample = nn.Sequential(
+                nn.Conv1d(
+                    dim, dim, kernel_size=3, stride=scale_factor, padding=1, bias=False
+                ),
+                nn.BatchNorm1d(dim),
+                nn.GELU(),
+            )
+        elif mode == "pool":
+            # 使用最大池化进行下采样
+            self.downsample = nn.MaxPool1d(
+                kernel_size=scale_factor, stride=scale_factor
+            )
+        else:
+            raise ValueError(f"不支持的下采样模式: {mode}")
+
+    def forward(self, x):
+        """
+        Args:
+            x: 输入特征 [B, T, E, C]
+        Returns:
+            下采样后的特征 [B, T//scale_factor, E, C]
+        """
+        B, T, E, C = x.shape
+
+        # 重排为卷积格式
+        x = rearrange(x, "b t e c -> (b e) c t")
+
+        # 应用下采样
+        x = self.downsample(x)
+
+        # 重排回原始格式
+        new_T = T // self.scale_factor
+        x = rearrange(x, "(b e) c t -> b t e c", b=B, e=E)
+
+        return x
+
+
+class HierarchicalST_TR_Block(nn.Module):
+    """层次化时空Transformer块，支持时间维度下采样"""
+
+    def __init__(
+        self,
+        dim,
+        num_heads=8,
+        mlp_ratio=4.0,
+        qkv_bias=False,
+        drop=0.0,
+        attn_drop=0.0,
+        drop_path=0.0,
+        act_layer=nn.GELU,
+        downsample=False,
+        downsample_scale=2,
+        downsample_mode="conv",
+    ):
+        super().__init__()
+
+        # 空间注意力
+        self.norm1 = nn.LayerNorm(dim)
+        self.spatial_attn = GeometricCosineAttention(
+            dim,
+            num_heads=num_heads,
+            qkv_bias=qkv_bias,
+            attn_drop=attn_drop,
+            proj_drop=drop,
+        )
+
+        # 时间卷积
+        self.norm2 = nn.Identity()
+        self.temporal_attn = TemporalConvolution(
+            dim, kernel_size=3, expansion_factor=2, dropout=drop
+        )
+
+        # MLP
+        self.norm3 = nn.LayerNorm(dim)
+        mlp_hidden_dim = int(dim * mlp_ratio)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, mlp_hidden_dim),
+            act_layer(),
+            nn.Dropout(drop),
+            nn.Linear(mlp_hidden_dim, dim),
+            nn.Dropout(drop),
+        )
+
+        self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
+
+        # 时间下采样
+        self.downsample = downsample
+        if downsample:
+            self.temporal_downsampler = TemporalDownsampling(
+                dim, scale_factor=downsample_scale, mode=downsample_mode
+            )
+
+    def forward(self, x, adj_mask):
+        """
+        Args:
+            x: 输入特征 [B, T, E, C]
+            adj_mask: 邻接矩阵 [E, E]
+        """
+        B, T, E, C = x.shape
+
+        # 空间注意力
+        x_spatial = rearrange(x, "b t e c -> (b t) e c")
+        x_spatial = self.norm1(x_spatial)
+        x_spatial = self.spatial_attn(x_spatial, adj_mask)
+        x_spatial = rearrange(x_spatial, "(b t) e c -> b t e c", t=T)
+        x = x + self.drop_path(x_spatial)
+
+        # 时间卷积
+        x = x + self.drop_path(self.temporal_attn(self.norm2(x)))
+
+        # MLP
+        x = x + self.drop_path(self.mlp(self.norm3(x)))
+
+        # 时间下采样(如果启用)
+        if self.downsample:
+            x = self.temporal_downsampler(x)
+
+        return x
+
+
 class LGLT(nn.Module):
-    """Line Graph Linear Transformer for Skeleton-based Action Recognition"""
+    """具有层次化时间聚合的LGLT模型"""
 
     def __init__(
         self,
@@ -252,6 +519,9 @@ class LGLT(nn.Module):
         drop_path_rate=0.1,
         norm_layer=nn.LayerNorm,
         use_learnable_pos_emb=True,
+        temporal_downsample_layers=[1, 2],  # 哪些层执行下采样
+        downsample_scale=2,
+        downsample_mode="conv",
     ):
         super().__init__()
 
@@ -261,6 +531,15 @@ class LGLT(nn.Module):
         self.num_edges = num_edges
         self.in_channels = in_channels
         self.use_learnable_pos_emb = use_learnable_pos_emb
+        self.temporal_downsample_layers = temporal_downsample_layers
+
+        # 计算每层的时间维度大小
+        self.time_dims = [num_frames]
+        current_t = num_frames
+        for i in range(num_layers):
+            if i in temporal_downsample_layers:
+                current_t = current_t // downsample_scale
+            self.time_dims.append(current_t)
 
         # 特征嵌入
         self.embed = nn.Sequential(
@@ -269,25 +548,21 @@ class LGLT(nn.Module):
 
         # 位置编码
         if use_learnable_pos_emb:
-            # 可学习的位置编码
             self.pos_embed_temporal = nn.Parameter(
                 torch.zeros(1, num_frames, embed_dim)
             )
             nn.init.trunc_normal_(self.pos_embed_temporal, std=0.02)
         else:
-            # 固定的正弦余弦位置编码
             pos_table = get_sinusoid_encoding_table(num_frames, embed_dim)
-            self.register_buffer(
-                "pos_embed_temporal", pos_table.unsqueeze(0)
-            )  # [1, T, embed_dim]
+            self.register_buffer("pos_embed_temporal", pos_table.unsqueeze(0))
 
         # Drop path
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, num_layers)]
 
-        # Transformer blocks
+        # Transformer块 - 使用改进的层次化模块
         self.blocks = nn.ModuleList(
             [
-                ST_TR_Block(
+                HierarchicalST_TR_Block(
                     dim=embed_dim,
                     num_heads=num_heads,
                     mlp_ratio=mlp_ratio,
@@ -295,6 +570,9 @@ class LGLT(nn.Module):
                     drop=drop_rate,
                     attn_drop=attn_drop_rate,
                     drop_path=dpr[i],
+                    downsample=(i in temporal_downsample_layers),
+                    downsample_scale=downsample_scale,
+                    downsample_mode=downsample_mode,
                 )
                 for i in range(num_layers)
             ]
@@ -344,11 +622,10 @@ class LGLT(nn.Module):
         x = self.embed(x)
         x = rearrange(x, "(b t) e c -> b t e c", b=B)
 
-        # 使用预计算的位置编码或模型内置的位置编码
+        # 位置编码
         if pos_encodings is not None:
             pos_embed = pos_encodings.unsqueeze(2)  # [B, T, 1, embed_dim]
         else:
-            # 使用模型内置的位置编码（可学习或固定）
             pos_embed = self.pos_embed_temporal[:, :T, :].unsqueeze(
                 2
             )  # [1, T, 1, embed_dim]
@@ -356,10 +633,10 @@ class LGLT(nn.Module):
         x = x + pos_embed
 
         # 通过Transformer块
-        for blk in self.blocks:
+        for i, blk in enumerate(self.blocks):
             x = blk(x, adj_mask)
 
-        # 全局池化
+        # 全局池化 - 现在时间维度已经较小，效率更高
         x = x.mean(dim=2)  # 空间池化
         x = x.mean(dim=1)  # 时间池化
 

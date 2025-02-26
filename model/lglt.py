@@ -13,12 +13,6 @@ class GeometricCosineAttention(nn.Module):
         super().__init__()
         self.num_heads = num_heads
 
-        # 确保每个头有3个通道对应x,y,z方向
-        assert dim % num_heads == 0 and (dim // num_heads) >= 3, (
-            "维度必须能被头数整除且每个头至少3个通道"
-        )
-        self.head_dim = dim // num_heads
-
         # QKV的映射矩阵
         self.q_proj = nn.Linear(dim, dim, bias=qkv_bias)
         self.k_proj = nn.Linear(dim, dim, bias=qkv_bias)

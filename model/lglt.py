@@ -3,6 +3,7 @@ import math
 import torch
 import torch.nn as nn
 from einops import rearrange
+from einops.layers.torch import Rearrange
 from timm.models.layers import DropPath
 
 
@@ -88,66 +89,61 @@ class GeometricCosineAttention(nn.Module):
         return identity + self.gamma * x
 
 
-class TemporalAttention(nn.Module):
-    """时间域注意力模块"""
+# 修改 TemporalConvolution 类
 
-    def __init__(self, dim, num_heads=8, qkv_bias=False, attn_drop=0.0, proj_drop=0.0):
+
+class TemporalConvolution(nn.Module):
+    """时间域卷积模块，替代原有的时间注意力"""
+
+    def __init__(self, dim, kernel_size=3, expansion_factor=2, dropout=0.0):
         super().__init__()
-        self.num_heads = num_heads
-        head_dim = dim // num_heads
-        self.scale = head_dim**-0.5
+        self.dim = dim
+        self.kernel_size = kernel_size
 
-        # 分离QKV映射矩阵
-        self.q_proj = nn.Linear(dim, dim, bias=qkv_bias)
-        self.k_proj = nn.Linear(dim, dim, bias=qkv_bias)
-        self.v_proj = nn.Linear(dim, dim, bias=qkv_bias)
+        # 扩张的隐藏层维度
+        hidden_dim = dim * expansion_factor
 
-        self.attn_drop = nn.Dropout(attn_drop)
-        self.proj = nn.Linear(dim, dim)
-        self.proj_drop = nn.Dropout(proj_drop)
+        # 预定义重排对象
+        self.rearrange_to_conv = Rearrange("b t e c -> (b e) c t")
 
-        self.gamma = nn.Parameter(torch.zeros(1))  # 添加gamma参数
+        # 构建时间卷积网络主体
+        self.conv_network = nn.Sequential(
+            # 第一层卷积 (升维)
+            nn.Conv1d(
+                dim, hidden_dim, kernel_size, padding=(kernel_size - 1) // 2, bias=False
+            ),
+            nn.BatchNorm1d(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            # 第二层卷积 (降维)
+            nn.Conv1d(hidden_dim, dim, 1, bias=False),
+            nn.BatchNorm1d(dim),
+            nn.Dropout(dropout),
+        )
+
+        # 层归一化（在卷积前应用）
+        self.norm = nn.LayerNorm(dim)
+        self.gamma = nn.Parameter(torch.zeros(1))  # 与注意力模块一致，使用gamma参数
 
     def forward(self, x):
         """
         Args:
             x: 输入特征 [B, T, E, C]
         """
-        identity = x  # 保存输入用于残差连接
         B, T, E, C = x.shape
+        identity = x  # 保存输入用于残差连接
 
-        # 重排为标准Transformer输入格式
-        x = rearrange(x, "b t e c -> (b e) t c")
+        # 应用归一化
+        x = self.norm(x)
 
-        # 分别生成Q,K,V
-        q = (
-            self.q_proj(x)
-            .reshape(-1, T, self.num_heads, C // self.num_heads)
-            .permute(0, 2, 1, 3)
-        )
-        k = (
-            self.k_proj(x)
-            .reshape(-1, T, self.num_heads, C // self.num_heads)
-            .permute(0, 2, 1, 3)
-        )
-        v = (
-            self.v_proj(x)
-            .reshape(-1, T, self.num_heads, C // self.num_heads)
-            .permute(0, 2, 1, 3)
-        )
+        # 重排为卷积格式
+        x = self.rearrange_to_conv(x)
 
-        # 计算注意力
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = attn.softmax(dim=-1)
-        attn = self.attn_drop(attn)
+        # 应用卷积网络
+        x = self.conv_network(x)
 
-        # 注意力输出
-        x = (attn @ v).transpose(1, 2).reshape(-1, T, C)
-        x = self.proj(x)
-        x = self.proj_drop(x)
-
-        # 恢复原始形状
-        x = rearrange(x, "(b e) t c -> b t e c", b=B)
+        # 重排回原始格式
+        x = rearrange(x, "(b e) c t -> b t e c", b=B, e=E)
 
         # 添加残差连接，使用gamma参数控制
         return identity + self.gamma * x
@@ -169,7 +165,7 @@ class ST_TR_Block(nn.Module):
     ):
         super().__init__()
 
-        # 空间注意力
+        # 空间注意力保持不变
         self.norm1 = nn.LayerNorm(dim)
         self.spatial_attn = GeometricCosineAttention(
             dim,
@@ -179,17 +175,16 @@ class ST_TR_Block(nn.Module):
             proj_drop=drop,
         )
 
-        # 时间注意力
-        self.norm2 = nn.LayerNorm(dim)
-        self.temporal_attn = TemporalAttention(
+        # 替换时间注意力为时间卷积
+        self.norm2 = nn.Identity()  # 卷积模块内部已包含LayerNorm
+        self.temporal_attn = TemporalConvolution(
             dim,
-            num_heads=num_heads,
-            qkv_bias=qkv_bias,
-            attn_drop=attn_drop,
-            proj_drop=drop,
+            kernel_size=3,  # 可以调整卷积核大小
+            expansion_factor=2,  # 可以调整扩张因子
+            dropout=drop,  # 使用相同的dropout率
         )
 
-        # MLP
+        # MLP保持不变
         self.norm3 = nn.LayerNorm(dim)
         mlp_hidden_dim = int(dim * mlp_ratio)
         self.mlp = nn.Sequential(
@@ -217,7 +212,7 @@ class ST_TR_Block(nn.Module):
         x_spatial = rearrange(x_spatial, "(b t) e c -> b t e c", t=T)
         x = x + self.drop_path(x_spatial)
 
-        # 时间注意力
+        # 时间卷积 - 使用正确的名称 temporal_attn
         x = x + self.drop_path(self.temporal_attn(self.norm2(x)))
 
         # MLP

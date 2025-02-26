@@ -12,6 +12,7 @@ class GeometricCosineAttention(nn.Module):
     def __init__(self, dim, num_heads=8, qkv_bias=False, attn_drop=0.0, proj_drop=0.0):
         super().__init__()
         self.num_heads = num_heads
+        self.head_dim = dim // num_heads
 
         # QKV的映射矩阵
         self.q_proj = nn.Linear(dim, dim, bias=qkv_bias)

@@ -62,12 +62,8 @@ class GeometricCosineAttention(nn.Module):
             .permute(0, 2, 1, 3)
         )
 
-        # 只使用前3个通道作为方向余弦
-        q_dir = q[:, :, :, :3]  # [B, num_heads, E, 3]
-        k_dir = k[:, :, :, :3]  # [B, num_heads, E, 3]
-
-        # 通过方向余弦点积计算余弦相似度
-        attn = torch.matmul(q_dir, k_dir.transpose(-2, -1))  # [B, num_heads, E, E]
+        # 不再限制使用前3个通道
+        attn = torch.matmul(q, k.transpose(-2, -1))  # [B, num_heads, E, E]
 
         # 应用邻接矩阵掩码
         mask = adj_mask.unsqueeze(0).unsqueeze(0)  # [1, 1, E, E]

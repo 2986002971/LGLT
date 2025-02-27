@@ -1606,8 +1606,7 @@ class FeederDual(Dataset):
     def load_data(self):
         """加载边特征数据"""
         temp_data = []
-        temp_pos_encodings = []  # 存储每个序列的位置编码
-        target_frames = 200  # 统一的序列长度
+        target_frames = 100  # 统一的序列长度
 
         for item in self.data_dict:
             file_name = item["file_name"]
@@ -1618,30 +1617,19 @@ class FeederDual(Dataset):
             features = np.array(edge_data["edge_cosines"])
             features = self._normalize_features(features)
 
-            # 为原始序列生成位置编码
+            # 重采样原始序列到目标帧数
             orig_frames = features.shape[0]
-            pos_encoding = get_sinusoid_encoding_table(orig_frames, self.embed_dim)
-
-            # 重采样原始序列和位置编码到目标帧数
             indices = np.linspace(0, orig_frames - 1, target_frames)
             indices = indices.astype(np.int32)
             features = features[indices]  # (target_frames, E, C)
-            pos_encoding = pos_encoding[indices]  # (target_frames, embed_dim)
 
             # 转换格式并存储
             features = np.transpose(features, (2, 0, 1))  # (C, target_frames, E)
             features = np.expand_dims(features, axis=0)  # (1, C, T, E)
             temp_data.append(features)
 
-            # 存储位置编码
-            pos_encoding = np.expand_dims(pos_encoding, axis=0)  # (1, T, embed_dim)
-            temp_pos_encodings.append(pos_encoding)
-
         # 合并所有样本
         self.data = np.concatenate(temp_data, axis=0)  # (N, C, T, E)
-        self.pos_encodings = np.concatenate(
-            temp_pos_encodings, axis=0
-        )  # (N, T, embed_dim)
 
     def _normalize_features(self, features):
         """特征归一化,使用MinMax或均值标准差"""
@@ -1672,7 +1660,6 @@ class FeederDual(Dataset):
         # 处理repeat的索引
         real_index = index % len(self.data_dict)
         data = self.data[real_index]  # (C, T, E)
-        pos_encoding = self.pos_encodings[real_index]  # (T, embed_dim)
         label = self.label[real_index]
 
         # 训练时进行随机视角增强
@@ -1692,7 +1679,8 @@ class FeederDual(Dataset):
         if self.normalization:
             data = (data - self.mean_map) / self.std_map
 
-        return data, label, pos_encoding, index
+        # 不再返回位置编码
+        return data, label, index
 
     def rand_view_transform(self, X, agx, agy, s):
         """

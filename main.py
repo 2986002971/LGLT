@@ -214,6 +214,40 @@ def get_parser():
     )
     parser.add_argument("--warm_up_epoch", type=int, default=0)
 
+    # 添加ST-GCN特定的参数
+    parser.add_argument(
+        "--window-size",
+        type=int,
+        default=9,
+        help="window size for temporal convolution in ST-GCN",
+    )
+    parser.add_argument(
+        "--tcn-dropout",
+        type=float,
+        default=0.2,
+        help="dropout rate for temporal convolution",
+    )
+    parser.add_argument(
+        "--st-gcn-channels",
+        type=int,
+        default=[64, 64, 128, 128, 256, 256],
+        nargs="+",
+        help="channel numbers of ST-GCN layers",
+    )
+    parser.add_argument(
+        "--st-gcn-strides",
+        type=int,
+        default=[1, 1, 2, 1, 2, 1],
+        nargs="+",
+        help="strides of ST-GCN layers",
+    )
+    parser.add_argument(
+        "--residual",
+        type=str2bool,
+        default=True,
+        help="use residual connection in ST-GCN",
+    )
+
     # 添加LGLT特定的参数
     parser.add_argument(
         "--adj-matrix",
@@ -314,6 +348,33 @@ class Processor:
                     adj_matrix[edge[0], edge[1]] = 1
                     adj_matrix[edge[1], edge[0]] = 1  # 确保是对称的
                 self.adj_matrix = adj_matrix.cuda(output_device)
+
+        if "st_gcn" in self.arg.model.lower():
+            # 从配置中读取通道数和步长
+            if hasattr(self.arg, "st_gcn_channels") and hasattr(
+                self.arg, "st_gcn_strides"
+            ):
+                channels = self.arg.st_gcn_channels
+                strides = self.arg.st_gcn_strides
+            else:
+                # 默认值
+                channels = [64, 64, 128, 128, 256, 256]
+                strides = [1, 1, 2, 1, 2, 1]
+
+            # 传递额外参数给模型
+            extra_args = {
+                "window_size": self.arg.window_size
+                if hasattr(self.arg, "window_size")
+                else 9,
+                "tcn_dropout": self.arg.tcn_dropout
+                if hasattr(self.arg, "tcn_dropout")
+                else 0.2,
+            }
+            self.arg.model_args.update(extra_args)
+
+            # 如果需要，还可以构建通道列表和步长列表传递给模型
+            self.arg.model_args["channels"] = channels
+            self.arg.model_args["strides"] = strides
 
         shutil.copy2(inspect.getfile(Model), self.arg.work_dir)
         self.model = Model(**self.arg.model_args)
@@ -440,17 +501,16 @@ class Processor:
         timer = dict(dataloader=0.001, model=0.001, statistics=0.001)
         process = tqdm(loader, ncols=40)
 
-        for batch_idx, (data, label, pos_encoding, index) in enumerate(process):
+        for batch_idx, (data, label, index) in enumerate(process):
             self.global_step += 1
             with torch.no_grad():
                 data = data.float().cuda(self.output_device)
                 label = label.long().cuda(self.output_device)
-                pos_encoding = pos_encoding.float().to(self.output_device)
             timer["dataloader"] += self.split_time()
 
             # forward
             if "lglt" in self.arg.model.lower():
-                output = self.model(data, self.adj_matrix, pos_encodings=pos_encoding)
+                output = self.model(data, self.adj_matrix)
             else:
                 output = self.model(data)
             loss = self.loss(output, label)
@@ -526,16 +586,13 @@ class Processor:
             pred_list = []
             step = 0
             process = tqdm(self.data_loader[ln], ncols=40)
-            for batch_idx, (data, label, pos_encoding, index) in enumerate(process):
+            for batch_idx, (data, label, index) in enumerate(process):
                 label_list.append(label)
                 with torch.no_grad():
                     data = data.float().cuda(self.output_device)
                     label = label.long().cuda(self.output_device)
-                    pos_encoding = pos_encoding.float().to(self.output_device)
                     if "lglt" in self.arg.model.lower():
-                        output = self.model(
-                            data, self.adj_matrix, pos_encodings=pos_encoding
-                        )
+                        output = self.model(data, self.adj_matrix)
                     else:
                         output = self.model(data)
                     loss = self.loss(output, label)

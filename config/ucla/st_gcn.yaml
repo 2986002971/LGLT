@@ -1,0 +1,58 @@
+# feeder
+feeder: feeders.feeder_ucla_dual.FeederDual  # 保持相同的供料器
+train_feeder_args:
+  data_path: data/NW-UCLA/all_sqe_edge  # 边特征数据路径
+  label_path: train
+  debug: False
+  repeat: 5
+  normalization: False
+  embed_dim: 64  # 保留以兼容现有代码
+
+test_feeder_args:
+  data_path: data/NW-UCLA/all_sqe_edge
+  label_path: val
+  debug: False
+  normalization: False
+  embed_dim: 64  # 保留以兼容现有代码
+
+# model
+model: model.st_gcn.STGCN_UCLA  # 指定为新实现的UCLA版ST-GCN
+model_args:
+  in_channels: 3  # 方向余弦向量为3维
+  num_class: 10  # UCLA有10个动作类别
+  graph_cfg:
+    layout: "ucla"
+    strategy: "distance"  # 使用距离策略而非空间策略
+    max_hop: 2           # 考虑2跳邻居
+    dilation: 1          # 无膨胀率
+  edge_importance_weighting: True  # 启用边权重学习
+  data_bn: True          # 启用批归一化
+  dropout: 0.2          # 添加dropout以减少过拟合
+
+# optim
+weight_decay: 0.0001
+base_lr: 0.1
+lr_decay_rate: 0.1
+step: [50]  # 学习率衰减步骤
+
+# training
+device: 0  # GPU设备ID
+batch_size: 32
+test_batch_size: 64
+num_epoch: 200
+nesterov: True  # 使用Nesterov动量
+warm_up_epoch: 5  # 学习率预热周期
+
+# model specific
+window_size: 9  # 使用下划线而非连字符
+tcn_dropout: 0.2
+residual: True
+
+# architecture 
+st_gcn_channels: [3, 64, 128, 128, 256, 256]
+st_gcn_strides: [1, 1, 2, 1, 2, 1]
+
+# data augmentation
+# random_rot: True  # 随机旋转增强
+# random_shift: True  # 随机位移增强
+# random_scale: True  # 随机缩放增强

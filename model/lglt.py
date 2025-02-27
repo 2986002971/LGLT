@@ -88,6 +88,61 @@ class GeometricCosineAttention(nn.Module):
         return identity + self.gamma * x
 
 
+class TemporalDownsampling(nn.Module):
+    """时间维度下采样模块"""
+
+    def __init__(self, dim, mode="interpolate"):
+        super().__init__()
+        self.mode = mode
+
+        if mode == "conv":
+            # 使用卷积进行下采样
+            self.downsample = nn.Sequential(
+                nn.Conv1d(dim, dim, kernel_size=3, stride=2, padding=1, bias=False),
+                nn.BatchNorm1d(dim),
+                nn.GELU(),
+            )
+        elif mode == "pool":
+            # 使用最大池化进行下采样
+            self.downsample = nn.MaxPool1d(kernel_size=3, stride=2, padding=1)
+        elif mode == "interpolate":
+            # 使用插值方法，更灵活处理各种长度
+            self.downsample = None
+        else:
+            raise ValueError(f"不支持的下采样模式: {mode}")
+
+    def forward(self, x):
+        """
+        Args:
+            x: 输入特征 [B, T, E, C]
+        Returns:
+            下采样后的特征 [B, T_new, E, C]，其中T_new = T//2 + (T%2)
+        """
+        B, T, E, C = x.shape
+
+        # 计算新的时间维度
+        T_new = T // 2 + (T % 2)
+
+        if self.mode == "interpolate":
+            # 重排为适合插值的格式
+            x_reshaped = rearrange(x, "b t e c -> (b e) c t")
+
+            # 使用插值进行下采样
+            x_down = nn.functional.interpolate(
+                x_reshaped, size=T_new, mode="linear" if T > 1 else "nearest"
+            )
+
+            # 重排回原始格式
+            x_down = rearrange(x_down, "(b e) c t -> b t e c", b=B, e=E)
+            return x_down
+        else:
+            # 使用卷积或池化方法
+            x_reshaped = rearrange(x, "b t e c -> (b e) c t")
+            x_down = self.downsample(x_reshaped)
+            x_down = rearrange(x_down, "(b e) c t -> b t e c", b=B, e=E)
+            return x_down
+
+
 class TemporalAttention(nn.Module):
     """时间域注意力模块"""
 
@@ -151,6 +206,87 @@ class TemporalAttention(nn.Module):
 
         # 添加残差连接，使用gamma参数控制
         return identity + self.gamma * x
+
+
+class ProgressiveST_TR_Block(nn.Module):
+    """渐进式时空Transformer块，每层进行时间维度下采样"""
+
+    def __init__(
+        self,
+        dim,
+        num_heads=8,
+        mlp_ratio=4.0,
+        qkv_bias=False,
+        drop=0.0,
+        attn_drop=0.0,
+        drop_path=0.0,
+        act_layer=nn.GELU,
+        downsample_mode="interpolate",
+    ):
+        super().__init__()
+
+        # 空间注意力
+        self.norm1 = nn.LayerNorm(dim)
+        self.spatial_attn = GeometricCosineAttention(
+            dim,
+            num_heads=num_heads,
+            qkv_bias=qkv_bias,
+            attn_drop=attn_drop,
+            proj_drop=drop,
+        )
+
+        # 时间注意力
+        self.norm2 = nn.LayerNorm(dim)
+        self.temporal_attn = TemporalAttention(
+            dim,
+            num_heads=num_heads,
+            qkv_bias=qkv_bias,
+            attn_drop=attn_drop,
+            proj_drop=drop,
+        )
+
+        # MLP
+        self.norm3 = nn.LayerNorm(dim)
+        mlp_hidden_dim = int(dim * mlp_ratio)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, mlp_hidden_dim),
+            act_layer(),
+            nn.Dropout(drop),
+            nn.Linear(mlp_hidden_dim, dim),
+            nn.Dropout(drop),
+        )
+
+        self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
+
+        # 时间下采样 - 每层都会进行
+        self.temporal_downsampler = TemporalDownsampling(dim, mode=downsample_mode)
+
+    def forward(self, x, adj_mask):
+        """
+        Args:
+            x: 输入特征 [B, T, E, C]
+            adj_mask: 邻接矩阵 [E, E]
+        """
+        B, T, E, C = x.shape
+
+        # 空间注意力
+        x_spatial = rearrange(x, "b t e c -> (b t) e c")
+        x_spatial = self.norm1(x_spatial)
+        x_spatial = self.spatial_attn(x_spatial, adj_mask)
+        x_spatial = rearrange(x_spatial, "(b t) e c -> b t e c", t=T)
+        x = x + self.drop_path(x_spatial)
+
+        # 时间注意力
+        x = x + self.drop_path(self.temporal_attn(self.norm2(x)))
+
+        # MLP
+        x = x + self.drop_path(self.mlp(self.norm3(x)))
+
+        # 时间下采样 - 在每层的最后进行
+        if T > 1:  # 只有当时间维度>1时才进行下采样
+            x = self.temporal_downsampler(x)
+
+        return x
 
 
 class ST_TR_Block(nn.Module):
@@ -239,7 +375,7 @@ def get_sinusoid_encoding_table(length, dim):
 
 
 class LGLT(nn.Module):
-    """Line Graph Linear Transformer for Skeleton-based Action Recognition"""
+    """具有渐进式时间聚合的LGLT模型 - 每层都进行时间聚合"""
 
     def __init__(
         self,
@@ -257,6 +393,7 @@ class LGLT(nn.Module):
         drop_path_rate=0.1,
         norm_layer=nn.LayerNorm,
         use_learnable_pos_emb=True,
+        downsample_mode="interpolate",
     ):
         super().__init__()
 
@@ -266,6 +403,15 @@ class LGLT(nn.Module):
         self.num_edges = num_edges
         self.in_channels = in_channels
         self.use_learnable_pos_emb = use_learnable_pos_emb
+        self.num_layers = num_layers
+
+        # 预计算每层时间维度的大小
+        self.time_dims = [num_frames]
+        current_t = num_frames
+        for i in range(num_layers):
+            if current_t > 1:
+                current_t = current_t // 2 + (current_t % 2)
+            self.time_dims.append(current_t)
 
         # 特征嵌入
         self.embed = nn.Sequential(
@@ -289,10 +435,10 @@ class LGLT(nn.Module):
         # Drop path
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, num_layers)]
 
-        # Transformer blocks
+        # 渐进式Transformer块
         self.blocks = nn.ModuleList(
             [
-                ST_TR_Block(
+                ProgressiveST_TR_Block(
                     dim=embed_dim,
                     num_heads=num_heads,
                     mlp_ratio=mlp_ratio,
@@ -300,6 +446,7 @@ class LGLT(nn.Module):
                     drop=drop_rate,
                     attn_drop=attn_drop_rate,
                     drop_path=dpr[i],
+                    downsample_mode=downsample_mode,
                 )
                 for i in range(num_layers)
             ]
@@ -349,24 +496,24 @@ class LGLT(nn.Module):
         x = self.embed(x)
         x = rearrange(x, "(b t) e c -> b t e c", b=B)
 
-        # 使用预计算的位置编码或模型内置的位置编码
+        # 位置编码
         if pos_encodings is not None:
             pos_embed = pos_encodings.unsqueeze(2)  # [B, T, 1, embed_dim]
         else:
-            # 使用模型内置的位置编码（可学习或固定）
             pos_embed = self.pos_embed_temporal[:, :T, :].unsqueeze(
                 2
             )  # [1, T, 1, embed_dim]
 
         x = x + pos_embed
 
-        # 通过Transformer块
-        for blk in self.blocks:
+        # 通过渐进式Transformer块
+        for i, blk in enumerate(self.blocks):
             x = blk(x, adj_mask)
+            # 这里不需要手动下采样，因为每个块内部会自动处理
 
-        # 全局池化
+        # 分类前的全局池化 - 由于时间维度已经很小，池化更高效
         x = x.mean(dim=2)  # 空间池化
-        x = x.mean(dim=1)  # 时间池化
+        x = x.mean(dim=1)  # 时间池化 (此时时间维度已经很小)
 
         # 分类
         x = self.norm(x)
